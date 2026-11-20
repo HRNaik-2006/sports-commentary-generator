@@ -1,4 +1,4 @@
-"""Tiny character language model with a from-scratch LoRA adapter."""
+"""Small character model and handwritten low-rank adapter for match calls."""
 from __future__ import annotations
 
 import random
@@ -11,8 +11,13 @@ from torch.nn import functional as F
 from .core import build_training_text, seed_examples
 
 
-class LoRALinear(nn.Module):
-    """Frozen linear projection plus trainable low-rank update (BA * alpha/r)."""
+class CommentaryProjection(nn.Module):
+    """A frozen score projection with a trainable, rank-limited correction.
+
+    The two adapter matrices form a down-then-up path. Starting the up matrix
+    at zero keeps the freshly initialized model's predictions unchanged until
+    training begins.
+    """
 
     def __init__(self, in_features: int, out_features: int, rank: int = 4, alpha: float = 8.0):
         super().__init__()
@@ -21,36 +26,53 @@ class LoRALinear(nn.Module):
         self.base = nn.Linear(in_features, out_features)
         self.base.weight.requires_grad_(False)
         self.base.bias.requires_grad_(False)
-        self.lora_A = nn.Parameter(torch.empty(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+        self.adapter_down = nn.Parameter(torch.empty(rank, in_features))
+        self.adapter_up = nn.Parameter(torch.zeros(out_features, rank))
+        nn.init.kaiming_uniform_(self.adapter_down, a=5**0.5)
         self.scale = alpha / rank
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
+        low_rank_update = F.linear(F.linear(x, self.adapter_down), self.adapter_up)
+        return self.base(x) + low_rank_update * self.scale
+
+    @property
+    def lora_A(self) -> nn.Parameter:
+        """Legacy accessor retained for the original drill's public API."""
+        return self.adapter_down
+
+    @property
+    def lora_B(self) -> nn.Parameter:
+        """Legacy accessor retained for the original drill's public API."""
+        return self.adapter_up
 
 
-class TinyCharLM(nn.Module):
+class PlayByPlayLanguageModel(nn.Module):
+    """Character-level next-token model used for the local training exercise."""
     def __init__(self, vocab_size: int, embedding_dim: int = 48, rank: int = 4):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.adapter = LoRALinear(embedding_dim, vocab_size, rank=rank)
+        self.adapter = CommentaryProjection(embedding_dim, vocab_size, rank=rank)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         return self.adapter(self.embedding(ids))
 
 
 @dataclass
-class TrainedModel:
-    model: TinyCharLM
+class CommentaryModelSnapshot:
+    model: PlayByPlayLanguageModel
     stoi: dict[str, int]
     itos: list[str]
     training_loss: float
 
 
-def train_lora(steps: int = 160, learning_rate: float = 0.025, rank: int = 4,
-               examples: list[tuple[str, str]] | None = None, seed: int = 7) -> TrainedModel:
-    """Train only LoRA parameters over a tiny character next-token objective."""
+def train_commentary_adapter(steps: int = 160, learning_rate: float = 0.025, rank: int = 4,
+                             examples: list[tuple[str, str]] | None = None,
+                             seed: int = 7) -> CommentaryModelSnapshot:
+    """Fit the low-rank correction on event-to-call examples.
+
+    The compact corpus is repeated as a next-character stream, making adapter
+    behavior easy to inspect without downloading a base checkpoint.
+    """
     if steps < 1:
         raise ValueError("steps must be at least 1")
     random.seed(seed)
@@ -60,12 +82,14 @@ def train_lora(steps: int = 160, learning_rate: float = 0.025, rank: int = 4,
     chars = sorted(set(text))
     stoi = {ch: i for i, ch in enumerate(chars)}
     ids = torch.tensor([stoi[ch] for ch in text], dtype=torch.long)
-    model = TinyCharLM(len(chars), rank=rank)
+    model = PlayByPlayLanguageModel(len(chars), rank=rank)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    for parameter in (model.adapter.lora_A, model.adapter.lora_B):
+    for parameter in (model.adapter.adapter_down, model.adapter.adapter_up):
         parameter.requires_grad_(True)
-    optimizer = torch.optim.Adam([model.adapter.lora_A, model.adapter.lora_B], lr=learning_rate)
+    optimizer = torch.optim.Adam(
+        [model.adapter.adapter_down, model.adapter.adapter_up], lr=learning_rate
+    )
     seq_len = min(96, max(16, len(ids) // 8))
     loss_value = 0.0
     model.train()
@@ -79,12 +103,13 @@ def train_lora(steps: int = 160, learning_rate: float = 0.025, rank: int = 4,
         loss.backward()
         optimizer.step()
         loss_value = float(loss.detach())
-    return TrainedModel(model.eval(), stoi, chars, loss_value)
+    return CommentaryModelSnapshot(model.eval(), stoi, chars, loss_value)
 
 
-def generate(model: TrainedModel, prompt: str, max_new_tokens: int = 180,
-             temperature: float = 0.8, seed: int | None = None) -> str:
-    """Sample locally from the trained model, with safe handling of unknown chars."""
+def generate_play_call(model: CommentaryModelSnapshot, prompt: str,
+                       max_new_tokens: int = 180, temperature: float = 0.8,
+                       seed: int | None = None) -> str:
+    """Sample a play call from the event prompt and the trained character model."""
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
     if seed is not None:
@@ -109,9 +134,25 @@ def generate(model: TrainedModel, prompt: str, max_new_tokens: int = 180,
     return result or "The action is building, and every moment matters!"
 
 
-def generate_commentary(prompt: str, model: TrainedModel | None = None,
+def train_lora(*args, **kwargs) -> CommentaryModelSnapshot:
+    """Compatibility name for callers from the first project iteration."""
+    return train_commentary_adapter(*args, **kwargs)
+
+
+def generate(model: CommentaryModelSnapshot, prompt: str, max_new_tokens: int = 180,
+             temperature: float = 0.8, seed: int | None = None) -> str:
+    """Compatibility name for the original sampling helper."""
+    return generate_play_call(model, prompt, max_new_tokens, temperature, seed)
+
+
+LoRALinear = CommentaryProjection
+TinyCharLM = PlayByPlayLanguageModel
+TrainedModel = CommentaryModelSnapshot
+
+
+def generate_commentary(prompt: str, model: CommentaryModelSnapshot | None = None,
                         temperature: float = 0.75, max_new_tokens: int = 180) -> str:
-    """Friendly one-call interface; trains a small adapter when no model is supplied."""
-    trained = model or train_lora()
-    return generate(trained, prompt, max_new_tokens=max_new_tokens, temperature=temperature)
+    """Convenience entry point that trains an adapter if none was supplied."""
+    trained = model or train_commentary_adapter()
+    return generate_play_call(trained, prompt, max_new_tokens, temperature)
 

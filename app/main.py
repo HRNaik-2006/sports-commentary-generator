@@ -6,13 +6,13 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from app.core import MatchEvent, format_prompt, seed_examples
-from app.llm import TrainedModel, generate, train_lora
+from app.llm import CommentaryModelSnapshot, generate_play_call, train_commentary_adapter
 from app.storage import append_record
 
 
 @st.cache_resource(show_spinner=False)
-def cached_train(steps: int) -> TrainedModel:
-    return train_lora(steps=steps)
+def cached_adapter_fit(steps: int) -> CommentaryModelSnapshot:
+    return train_commentary_adapter(steps=steps)
 
 
 def main() -> None:
@@ -25,7 +25,7 @@ def main() -> None:
         st.markdown("The base projection stays frozen; only the low-rank A and B matrices are trained.")
         if st.button("Train / load adapter", type="primary"):
             with st.spinner("Training the local PyTorch adapter…"):
-                st.session_state.adapter_model = cached_train(steps)
+                st.session_state.adapter_model = cached_adapter_fit(steps)
             st.success(f"Adapter ready · final batch loss {st.session_state.adapter_model.training_loss:.3f}")
         if "adapter_model" not in st.session_state:
             st.info("Train the adapter to enable generation.")
@@ -59,7 +59,7 @@ def main() -> None:
                     st.warning("Train the adapter in the sidebar first.")
                 else:
                     with st.spinner("Calling the play…"):
-                        output = generate(model, prompt, temperature=0.72)
+                        output = generate_play_call(model, prompt, temperature=0.72)
                     st.markdown(f"> {output}")
                     append_record("data/generations.jsonl", {"timestamp": datetime.now(timezone.utc).isoformat(), "prompt": prompt, "commentary": output})
         st.markdown("**Seed examples**")
