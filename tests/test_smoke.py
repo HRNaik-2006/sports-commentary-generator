@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 
 from app.llm import LoRALinear, generate, train_lora
@@ -19,8 +21,15 @@ def test_tiny_training_and_generation():
     assert trained.training_loss > 0
 
 
-def test_jsonl_storage_round_trip(tmp_path):
-    path = tmp_path / "nested" / "records.jsonl"
-    append_record(path, {"event": "goal", "commentary": "What a finish!"})
-    assert load_records(path) == [{"event": "goal", "commentary": "What a finish!"}]
+def test_jsonl_storage_round_trip():
+    test_directory = Path(".storage-test-data")
+    path = test_directory / "nested" / "records.jsonl"
+    try:
+        append_record(path, {"event": "goal", "commentary": "What a finish!"})
+        assert load_records(path) == [{"event": "goal", "commentary": "What a finish!"}]
+    finally:
+        if path.exists():
+            path.unlink()
+        path.parent.rmdir()
+        test_directory.rmdir()
 
